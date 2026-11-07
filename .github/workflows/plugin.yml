@@ -1,0 +1,156 @@
+name: Plugin
+
+on:
+  workflow_call:
+    inputs:
+      porla-version:
+        description: Porla tag or commit whose Lua types the plugin is checked against, e.g. v0.55.0
+        required: true
+        type: string
+      files:
+        description: Files, directories and globs to put in the release zip, separated by spaces or newlines. plugin.json is always included
+        required: true
+        type: string
+      luals-version:
+        description: lua-language-server release to check with
+        required: false
+        type: string
+        default: 3.19.2
+
+jobs:
+  luals:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: plugin
+
+      - uses: actions/checkout@v7
+        with:
+          repository: porla/porla
+          ref: ${{ inputs.porla-version }}
+          path: porla
+          sparse-checkout: types/lua
+          persist-credentials: false
+
+      - name: Install lua-language-server
+        env:
+          LUALS_VERSION: ${{ inputs.luals-version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/luals"
+          curl -fsSL "https://github.com/LuaLS/lua-language-server/releases/download/${LUALS_VERSION}/lua-language-server-${LUALS_VERSION}-linux-x64.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP/luals"
+
+      # LuaLS passes code that calls Porla APIs wrongly when the stubs are missing, so a missing
+      # types/lua has to fail here rather than give a green check
+      - name: Configure
+        env:
+          PORLA_VERSION: ${{ inputs.porla-version }}
+          STUBS: ${{ github.workspace }}/porla/types/lua
+        run: |
+          if [ ! -d "$STUBS" ]; then
+            echo "::error::Porla $PORLA_VERSION has no types/lua"
+            exit 1
+          fi
+
+          config=plugin/.luarc.json
+          [ -f "$config" ] || config=/dev/null
+
+          jq -s --arg lib "$STUBS" \
+            '(.[0] // {}) | del(.workspace.library) | .["workspace.library"] = [$lib] | .["runtime.version"] //= "Lua 5.4"' \
+            "$config" > "$RUNNER_TEMP/luarc.json"
+
+          cat "$RUNNER_TEMP/luarc.json"
+
+      # older LuaLS versions exit 0 even with problems, so the summary line decides too.
+      - name: Check
+        run: |
+          set +e
+          output=$("$RUNNER_TEMP/luals/bin/lua-language-server" \
+            --check="$GITHUB_WORKSPACE/plugin" \
+            --configpath="$RUNNER_TEMP/luarc.json" \
+            --checklevel=Warning \
+            --logpath="$RUNNER_TEMP/luals-log" 2>&1)
+          status=$?
+          echo "$output"
+
+          if [ $status -ne 0 ] || ! grep -q "no problems found" <<< "$output"; then
+            cat "$RUNNER_TEMP/luals-log/check.json" 2>/dev/null
+            exit 1
+          fi
+
+  release:
+    if: >-
+      ${{
+        !cancelled()
+        && github.ref_type == 'tag'
+        && needs.luals.result == 'success'
+      }}
+    needs: [luals]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Package
+        id: package
+        env:
+          FILES: ${{ inputs.files }}
+          REPO: ${{ github.event.repository.name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          shopt -s nullglob globstar
+
+          version=${TAG#v}
+          dist="$RUNNER_TEMP/dist"
+          zip="$RUNNER_TEMP/$REPO-$version.zip"
+
+          if [ ! -f plugin.json ]; then
+            echo "::error::plugin.json is missing"
+            exit 1
+          fi
+
+          mkdir -p "$dist"
+
+          # split without globbing, so a pattern matching nothing is an error instead of skipped
+          set -f
+          patterns=($FILES)
+          set +f
+
+          for pattern in "${patterns[@]}"; do
+            matches=($pattern)
+
+            if [ ${#matches[@]} -eq 0 ] || [ ! -e "${matches[0]}" ]; then
+              echo "::error::'$pattern' matches no files"
+              exit 1
+            fi
+
+            cp -r --parents "${matches[@]}" "$dist"
+          done
+
+          jq --arg version "$version" '.version = $version' plugin.json > "$dist/plugin.json"
+
+          (cd "$dist" && zip -r "$zip" .)
+          unzip -l "$zip"
+
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
+
+      # re-running a tag replaces the zip on its draft, but never touches a published release
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          if ! draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            gh release create "$TAG" "$ZIP" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$TAG" --generate-notes
+          elif [ "$draft" = "true" ]; then
+            gh release upload "$TAG" "$ZIP" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            echo "::error::$TAG is already published"
+            exit 1
+          fi
+
